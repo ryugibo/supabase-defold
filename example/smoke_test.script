@@ -1,0 +1,123 @@
+-- Live smoke test against a real Supabase project.
+-- Configure [supabase] url / anon_key (/ schema) in game.project, run example/setup.sql, then Project -> Build.
+-- Each step runs after the previous one finishes; results are printed to the console and drawn on screen.
+local supabase = require("supabase.client")
+
+local lines = {}
+
+local function log(ok, text)
+	local line = (ok and "PASS " or "FAIL ") .. text
+	print("[supabase] " .. line)
+	lines[#lines + 1] = line
+end
+
+local function info(text)
+	print("[supabase] " .. text)
+	lines[#lines + 1] = text
+end
+
+local function describe(err)
+	return string.format("%s (status %s%s)", tostring(err.message), tostring(err.status),
+		err.code and (", code " .. tostring(err.code)) or "")
+end
+
+-- Run steps in order. A step is fn(sb, state, next) and must call next(ok, description).
+local function run(sb, steps)
+	local state = {}
+	local passed = 0
+	local function step(i)
+		if i > #steps then
+			info(string.format("Done: %d/%d steps passed", passed, #steps))
+			return
+		end
+		steps[i].fn(sb, state, function(ok, text)
+			if ok then
+				passed = passed + 1
+			end
+			log(ok, steps[i].name .. (text and (": " .. text) or ""))
+			step(i + 1)
+		end)
+	end
+	step(1)
+end
+
+local STEPS = {
+	{ name = "auth.sign_in_anonymously", fn = function(sb, state, next)
+		sb.auth:sign_in_anonymously(function(err, session)
+			if err then return next(false, describe(err)) end
+			next(session.access_token ~= nil, "user " .. tostring(sb:user_id()))
+		end)
+	end },
+	{ name = "auth.get_user", fn = function(sb, state, next)
+		sb.auth:get_user(function(err, user)
+			if err then return next(false, describe(err)) end
+			next(user.id == sb:user_id(), "is_anonymous=" .. tostring(user.is_anonymous))
+		end)
+	end },
+	{ name = "db.insert", fn = function(sb, state, next)
+		sb.db:from("todos"):insert({ title = "hello from Defold" }):single():execute(function(err, row)
+			if err then return next(false, describe(err)) end
+			state.id = row and row.id
+			next(state.id ~= nil, "id " .. tostring(state.id))
+		end)
+	end },
+	{ name = "db.select", fn = function(sb, state, next)
+		sb.db:from("todos"):select("id,title,done"):eq("id", state.id):execute(function(err, rows)
+			if err then return next(false, describe(err)) end
+			next(#rows == 1 and rows[1].title == "hello from Defold", #rows .. " row(s)")
+		end)
+	end },
+	{ name = "db.update", fn = function(sb, state, next)
+		sb.db:from("todos"):update({ done = true }):eq("id", state.id):single():execute(function(err, row)
+			if err then return next(false, describe(err)) end
+			next(row ~= nil and row.done == true)
+		end)
+	end },
+	{ name = "rpc.call", fn = function(sb, state, next)
+		sb.rpc:call("add_numbers", { a = 2, b = 3 }, function(err, result)
+			if err then return next(false, describe(err)) end
+			next(result == 5, "add_numbers(2, 3) = " .. tostring(result))
+		end)
+	end },
+	{ name = "db.delete", fn = function(sb, state, next)
+		sb.db:from("todos"):delete():eq("id", state.id):execute(function(err, rows)
+			if err then return next(false, describe(err)) end
+			next(#rows == 1, #rows .. " row(s) deleted")
+		end)
+	end },
+	{ name = "auth.refresh_session", fn = function(sb, state, next)
+		sb.auth:refresh_session(function(err, session)
+			if err then return next(false, describe(err)) end
+			next(session.access_token ~= nil and not sb.auth:needs_refresh())
+		end)
+	end },
+	{ name = "auth.sign_out", fn = function(sb, state, next)
+		sb.auth:sign_out(function(err)
+			if err then return next(false, describe(err)) end
+			next(sb.auth:get_session() == nil)
+		end)
+	end },
+}
+
+function init(self)
+	local url = sys.get_config_string("supabase.url", "")
+	local anon_key = sys.get_config_string("supabase.anon_key", "")
+	local schema = sys.get_config_string("supabase.schema", "")
+	if url == "" or anon_key == "" then
+		info("Set [supabase] url and anon_key in game.project to run the smoke test.")
+		return
+	end
+	info("Testing " .. url)
+	local sb = supabase.new({ url = url, anon_key = anon_key, schema = schema ~= "" and schema or nil })
+	run(sb, STEPS)
+end
+
+function update(self, dt)
+	for i, line in ipairs(lines) do
+		msg.post("@render:", "draw_debug_text", {
+			text = line,
+			position = vmath.vector3(20, 620 - i * 20, 0),
+			color = line:sub(1, 4) == "FAIL" and vmath.vector4(1, 0.4, 0.4, 1) or vmath.vector4(1, 1, 1, 1),
+		})
+	end
+end
