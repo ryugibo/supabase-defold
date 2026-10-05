@@ -1,17 +1,12 @@
 -- Live smoke test against a real Supabase project.
--- Configure [supabase] url / anon_key (/ schema) in game.project, run example/setup.sql, then Project -> Build.
--- Each step runs after the previous one finishes; results are printed to the console and drawn on screen.
+-- Run tools/setup_supabase.sh remote (or local) once: it applies example/supabase and fills [supabase] in
+-- game.project. Then Project -> Build. Steps run one after another; results are printed to the console and drawn on screen.
 local supabase = require("supabase.client")
 
+local STEP_TIMEOUT = 10
 local lines = {}
 
-local function log(ok, text)
-	local line = (ok and "PASS " or "FAIL ") .. text
-	print("[supabase] " .. line)
-	lines[#lines + 1] = line
-end
-
-local function info(text)
+local function show(text)
 	print("[supabase] " .. text)
 	lines[#lines + 1] = text
 end
@@ -21,94 +16,221 @@ local function describe(err)
 		err.code and (", code " .. tostring(err.code)) or "")
 end
 
--- Run steps in order. A step is fn(sb, state, next) and must call next(ok, description).
+-- Run steps in order. A step is fn(sb, state, done) and calls done(ok, text) once; done(nil, text) = skipped.
 local function run(sb, steps)
 	local state = {}
-	local passed = 0
+	local passed, failed, skipped = 0, 0, 0
 	local function step(i)
 		if i > #steps then
-			info(string.format("Done: %d/%d steps passed", passed, #steps))
+			show(string.format("Done: %d passed, %d failed, %d skipped", passed, failed, skipped))
+			sb:remove_all_channels()
 			return
 		end
-		steps[i].fn(sb, state, function(ok, text)
-			if ok then
-				passed = passed + 1
+		local finished = false
+		local timeout
+		local function done(ok, text)
+			if finished then
+				return
 			end
-			log(ok, steps[i].name .. (text and (": " .. text) or ""))
+			finished = true
+			if timeout then
+				timer.cancel(timeout)
+			end
+			local label = ok == nil and "SKIP " or (ok and "PASS " or "FAIL ")
+			if ok == nil then
+				skipped = skipped + 1
+			elseif ok then
+				passed = passed + 1
+			else
+				failed = failed + 1
+			end
+			show(label .. steps[i].name .. (text and (": " .. text) or ""))
 			step(i + 1)
+		end
+		timeout = timer.delay(STEP_TIMEOUT, false, function()
+			timeout = nil
+			done(false, "timed out")
 		end)
+		steps[i].fn(sb, state, done)
 	end
 	step(1)
 end
 
+local FILE_BYTES = "\137PNG\r\n\26\n\0binary-safe"
+
 local STEPS = {
-	{ name = "auth.sign_in_anonymously", fn = function(sb, state, next)
+	{ name = "auth.sign_in_anonymously", fn = function(sb, state, done)
 		sb.auth:sign_in_anonymously(function(err, session)
-			if err then return next(false, describe(err)) end
-			next(session.access_token ~= nil, "user " .. tostring(sb:user_id()))
+			if err then return done(false, describe(err)) end
+			done(session.access_token ~= nil, "user " .. tostring(sb:user_id()))
 		end)
 	end },
-	{ name = "auth.get_user", fn = function(sb, state, next)
+	{ name = "auth.get_user", fn = function(sb, state, done)
 		sb.auth:get_user(function(err, user)
-			if err then return next(false, describe(err)) end
-			next(user.id == sb:user_id(), "is_anonymous=" .. tostring(user.is_anonymous))
+			if err then return done(false, describe(err)) end
+			done(user.id == sb:user_id(), "is_anonymous=" .. tostring(user.is_anonymous))
 		end)
 	end },
-	{ name = "db.insert", fn = function(sb, state, next)
-		sb.db:from("todos"):insert({ title = "hello from Defold" }):single():execute(function(err, row)
-			if err then return next(false, describe(err)) end
+	{ name = "realtime.subscribe", fn = function(sb, state, done)
+		state.changes = {}
+		state.broadcasts = {}
+		state.presence_synced = false
+		state.channel = sb:channel("smoke-" .. sb:user_id(), { broadcast = { self = true, ack = true }, presence = { key = sb:user_id() } })
+			:on("postgres_changes", { event = "*", schema = "public", table = "todos", filter = "user_id=eq." .. sb:user_id() },
+				function(change) table.insert(state.changes, change) end)
+			:on("broadcast", { event = "ping" }, function(msg) table.insert(state.broadcasts, msg.payload) end)
+			:on("presence", { event = "sync" }, function() state.presence_synced = true end)
+			-- SUBSCRIBED arrives before the server listens to Postgres; wait for its system message
+			:on("system", {}, function(msg)
+				if msg.extension == "postgres_changes" then
+					done(msg.status == "ok", tostring(msg.message))
+				end
+			end)
+			:subscribe(function(status, err)
+				if status ~= "SUBSCRIBED" and status ~= "CLOSED" then
+					done(false, status .. (err and (" " .. tostring(err.message)) or ""))
+				end
+			end)
+	end },
+	{ name = "db.insert", fn = function(sb, state, done)
+		sb:from("todos"):insert({ title = "hello from Defold" }):single():execute(function(err, row)
+			if err then return done(false, describe(err)) end
 			state.id = row and row.id
-			next(state.id ~= nil, "id " .. tostring(state.id))
+			done(state.id ~= nil, "id " .. tostring(state.id))
 		end)
 	end },
-	{ name = "db.select", fn = function(sb, state, next)
-		sb.db:from("todos"):select("id,title,done"):eq("id", state.id):execute(function(err, rows)
-			if err then return next(false, describe(err)) end
-			next(#rows == 1 and rows[1].title == "hello from Defold", #rows .. " row(s)")
+	{ name = "realtime.postgres_changes", fn = function(sb, state, done)
+		local function check()
+			for _, change in ipairs(state.changes) do
+				if change.eventType == "INSERT" and change.new.id == state.id then
+					return done(true, "INSERT received")
+				end
+			end
+			timer.delay(0.2, false, check)
+		end
+		check()
+	end },
+	{ name = "db.select (count, maybe_single)", fn = function(sb, state, done)
+		sb:from("todos"):select("id,title,done", { count = "exact" }):eq("id", state.id):maybe_single():execute(function(err, row, res)
+			if err then return done(false, describe(err)) end
+			done(row ~= nil and row.title == "hello from Defold" and res.count == 1, "count " .. tostring(res.count))
 		end)
 	end },
-	{ name = "db.update", fn = function(sb, state, next)
-		sb.db:from("todos"):update({ done = true }):eq("id", state.id):single():execute(function(err, row)
-			if err then return next(false, describe(err)) end
-			next(row ~= nil and row.done == true)
+	{ name = "db.update + filters", fn = function(sb, state, done)
+		sb:from("todos"):update({ done = true }):eq("id", state.id):ilike("title", "%defold%"):single():execute(function(err, row)
+			if err then return done(false, describe(err)) end
+			done(row ~= nil and row.done == true)
 		end)
 	end },
-	{ name = "rpc.call", fn = function(sb, state, next)
+	{ name = "rpc.call", fn = function(sb, state, done)
 		sb.rpc:call("add_numbers", { a = 2, b = 3 }, function(err, result)
-			if err then return next(false, describe(err)) end
-			next(result == 5, "add_numbers(2, 3) = " .. tostring(result))
+			if err then return done(false, describe(err)) end
+			done(result == 5, "add_numbers(2, 3) = " .. tostring(result))
 		end)
 	end },
-	{ name = "db.delete", fn = function(sb, state, next)
-		sb.db:from("todos"):delete():eq("id", state.id):execute(function(err, rows)
-			if err then return next(false, describe(err)) end
-			next(#rows == 1, #rows .. " row(s) deleted")
+	{ name = "custom schema (select + rpc)", fn = function(sb, state, done)
+		local custom = sb:schema("smoke_custom")
+		custom:from("notes"):select("body"):limit(1):single():execute(function(err, note)
+			if err then return done(false, describe(err)) end
+			custom:rpc("echo", { value = "ping" }):execute(function(err2, echoed)
+				if err2 then return done(false, describe(err2)) end
+				done(note.body == "hello from smoke_custom" and echoed == "ping")
+			end)
 		end)
 	end },
-	{ name = "auth.refresh_session", fn = function(sb, state, next)
+	{ name = "realtime.broadcast", fn = function(sb, state, done)
+		state.channel:send({ type = "broadcast", event = "ping", payload = { n = 42 } }, function(status)
+			if status ~= "ok" then return done(false, status) end
+			local function check()
+				if state.broadcasts[1] and state.broadcasts[1].n == 42 then
+					return done(true, "ack + echo received")
+				end
+				timer.delay(0.2, false, check)
+			end
+			check()
+		end)
+	end },
+	{ name = "realtime.presence", fn = function(sb, state, done)
+		state.channel:track({ online_at = os.time() }, function(status)
+			if status ~= "ok" then return done(false, status) end
+			local function check()
+				local me = state.channel:presence_state()[sb:user_id()]
+				if state.presence_synced and me then
+					return done(true, #me .. " presence(s) for this user")
+				end
+				timer.delay(0.2, false, check)
+			end
+			check()
+		end)
+	end },
+	{ name = "storage.upload", fn = function(sb, state, done)
+		state.path = sb:user_id() .. "/hello.bin"
+		sb.storage:from("smoke-test"):upload(state.path, FILE_BYTES, { content_type = "application/octet-stream", upsert = true },
+			function(err, data)
+				if err then return done(false, describe(err)) end
+				done(data.path == state.path, data.full_path)
+			end)
+	end },
+	{ name = "storage.download", fn = function(sb, state, done)
+		sb.storage:from("smoke-test"):download(state.path, function(err, bytes)
+			if err then return done(false, describe(err)) end
+			done(bytes == FILE_BYTES, #bytes .. " bytes")
+		end)
+	end },
+	{ name = "storage.list + signed url", fn = function(sb, state, done)
+		local bucket = sb.storage:from("smoke-test")
+		bucket:list(sb:user_id(), function(err, items)
+			if err then return done(false, describe(err)) end
+			bucket:create_signed_url(state.path, 60, function(err2, data)
+				if err2 then return done(false, describe(err2)) end
+				done(#items == 1 and data.signed_url:find("token=", 1, true) ~= nil, #items .. " file(s)")
+			end)
+		end)
+	end },
+	{ name = "storage.remove", fn = function(sb, state, done)
+		sb.storage:from("smoke-test"):remove({ state.path }, function(err, removed)
+			if err then return done(false, describe(err)) end
+			done(#removed == 1)
+		end)
+	end },
+	{ name = "functions.invoke", fn = function(sb, state, done)
+		local name = sys.get_config_string("smoke_test.function_name", "")
+		if name == "" then
+			return done(nil, "set [smoke_test] function_name to test")
+		end
+		sb.functions:invoke(name, { body = { name = "Defold" } }, function(err, data)
+			if err then return done(false, describe(err)) end
+			done(true, type(data) == "table" and tostring(data.message) or tostring(data))
+		end)
+	end },
+	{ name = "db.delete", fn = function(sb, state, done)
+		sb:from("todos"):delete():eq("id", state.id):execute(function(err, rows)
+			if err then return done(false, describe(err)) end
+			done(#rows == 1, #rows .. " row(s) deleted")
+		end)
+	end },
+	{ name = "auth.refresh_session", fn = function(sb, state, done)
 		sb.auth:refresh_session(function(err, session)
-			if err then return next(false, describe(err)) end
-			next(session.access_token ~= nil and not sb.auth:needs_refresh())
+			if err then return done(false, describe(err)) end
+			done(session.access_token ~= nil and not sb.auth:needs_refresh())
 		end)
 	end },
-	{ name = "auth.sign_out", fn = function(sb, state, next)
+	{ name = "auth.sign_out", fn = function(sb, state, done)
 		sb.auth:sign_out(function(err)
-			if err then return next(false, describe(err)) end
-			next(sb.auth:get_session() == nil)
+			if err then return done(false, describe(err)) end
+			done(sb.auth:get_session() == nil)
 		end)
 	end },
 }
 
 function init(self)
 	local url = sys.get_config_string("supabase.url", "")
-	local anon_key = sys.get_config_string("supabase.anon_key", "")
-	local schema = sys.get_config_string("supabase.schema", "")
-	if url == "" or anon_key == "" then
-		info("Set [supabase] url and anon_key in game.project to run the smoke test.")
+	if url == "" or sys.get_config_string("supabase.anon_key", "") == "" then
+		show("Run tools/setup_supabase.sh remote (or local), or set [supabase] url / anon_key in game.project.")
 		return
 	end
-	info("Testing " .. url)
-	local sb = supabase.new({ url = url, anon_key = anon_key, schema = schema ~= "" and schema or nil })
+	show("Testing " .. url)
+	local sb = supabase.new() -- url / anon_key from game.project [supabase]
 	run(sb, STEPS)
 end
 
@@ -116,7 +238,7 @@ function update(self, dt)
 	for i, line in ipairs(lines) do
 		msg.post("@render:", "draw_debug_text", {
 			text = line,
-			position = vmath.vector3(20, 620 - i * 20, 0),
+			position = vmath.vector3(20, 630 - i * 18, 0),
 			color = line:sub(1, 4) == "FAIL" and vmath.vector4(1, 0.4, 0.4, 1) or vmath.vector4(1, 1, 1, 1),
 		})
 	end

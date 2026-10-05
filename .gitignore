@@ -9,3 +9,6 @@ Thumbs.db
 .project
 .cproject
 builtins/dist
+
+# Supabase CLI cache when run from the repo root (supabase/ is the library, not a CLI project)
+/supabase/.temp

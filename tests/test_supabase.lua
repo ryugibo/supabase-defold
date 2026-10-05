@@ -1,19 +1,9 @@
 local supabase = require("supabase.client")
 
--- Fake server: records requests and replies with routes[method .. " " .. path]
+local H = require("tests.helpers")
+
 local function fake(routes)
-	local log = {}
-	local transport = function(url, method, headers, body, callback)
-		local path = url:gsub("^https://test%.supabase%.co", ""):gsub("%?.*$", "")
-		local entry = { url = url, method = method, headers = headers, body = body, path = path }
-		log[#log + 1] = entry
-		local route = routes[method .. " " .. path] or { 404, { message = "not found" } }
-		if type(route) == "function" then route = route(entry) end
-		callback(route[1], route[2], {})
-	end
-	local passthrough = { encode = function(t) return t end, decode = function(s) return s end }
-	local sb = supabase.new({ url = "https://test.supabase.co/", anon_key = "ANON", transport = transport, codec = passthrough })
-	return sb, log
+	return H.fake(routes)
 end
 
 test("urlencode / build_query", function()
@@ -34,7 +24,10 @@ end)
 test("anonymous sign-in, then requests use the session token", function()
 	local sb, log = fake({
 		["POST /auth/v1/signup"] = { 200, { access_token = "AT", refresh_token = "RT", expires_in = 3600, user = { id = "u1" } } },
-		["GET /rest/v1/profiles"] = { 200, { { id = "u1", gold = 5 } } },
+		["GET /rest/v1/profiles"] = function(e)
+			assert(e.headers.Accept == "application/vnd.pgrst.object+json", "single() asks for one object")
+			return { 200, { id = "u1", gold = 5 } }
+		end,
 	})
 	local changed
 	sb.auth:on_change(function(s) changed = s end)
@@ -42,7 +35,7 @@ test("anonymous sign-in, then requests use the session token", function()
 	assert(changed and changed.expires_at and sb:user_id() == "u1")
 	assert(type(log[1].body.data) == "table")
 	sb.db:from("profiles"):select():eq("id", "u1"):single():execute(function(err, row)
-		assert(row.gold == 5, "single() unwraps first row")
+		assert(row.gold == 5)
 	end)
 	assert(log[2].headers.Authorization == "Bearer AT")
 	assert(log[2].url:find("id=eq.u1", 1, true))
@@ -67,7 +60,7 @@ test("HTTP errors become err tables", function()
 	local sb = fake({ ["POST /rest/v1/rpc/boom"] = { 400, { message = "bad", code = "P0001", hint = "h" } } })
 	local e
 	sb.rpc:call("boom", nil, function(err, data) e = err; assert(data == nil) end)
-	assert(e.status == 400 and e.message == "bad" and e.code == "P0001" and e.details == "h")
+	assert(e.status == 400 and e.message == "bad" and e.code == "P0001" and e.hint == "h")
 	local sb2 = fake({ ["GET /rest/v1/x"] = { 0, nil } })
 	sb2.db:from("x"):select():execute(function(err) e = err end)
 	assert(e.status == 0 and e.message == "network error")
@@ -128,4 +121,36 @@ test("sign_up without tokens (email confirmation pending) does not replace the s
 	sb.auth:on_change(function() changed = changed + 1 end)
 	sb.auth:sign_up("a@b.c", "pw", function(err, data) got = data end)
 	assert(got.id == "u2" and changed == 0 and sb.auth:get_session() == nil)
+end)
+
+test("omitted options come from game.project [supabase]; explicit options win", function()
+	local values = {
+		["supabase.url"] = "https://cfg.supabase.co", ["supabase.anon_key"] = "CFGKEY", ["supabase.schema"] = "app",
+		["supabase.persist_session"] = "0", ["supabase.auto_refresh_token"] = "0", ["supabase.flow_type"] = "pkce",
+		["supabase.timeout"] = "30",
+	}
+	local saved = _G.sys
+	_G.sys = { get_config_string = function(key, default) return values[key] or default end }
+	local ok, err = pcall(function()
+		local h, opts
+		local transport = function(url, m, headers, b, cb, o) h, opts = { url = url, headers = headers }, o; cb(200, {}, {}) end
+		local sb = supabase.new({ transport = transport, codec = { encode = function(t) return t end, decode = function(s) return s end } })
+		assert(sb.url == "https://cfg.supabase.co" and sb.anon_key == "CFGKEY" and sb.auth.flow_type == "pkce")
+		assert(sb.auth.auto_refresh == false and sb.auth.storage == nil)
+		sb:from("t"):select():execute(function() end)
+		assert(h.url:find("^https://cfg.supabase.co/rest/v1/t") and h.headers["Accept-Profile"] == "app" and opts.timeout == 30)
+		local sb2 = supabase.new({ url = "https://x.supabase.co", schema = "other", transport = transport, codec = sb.codec })
+		assert(sb2.url == "https://x.supabase.co" and sb2.anon_key == "CFGKEY" and sb2.db_schema == "other")
+		values["supabase.url"] = ""
+		assert(not pcall(supabase.new, { transport = transport }), "url is still required")
+	end)
+	_G.sys = saved
+	assert(ok, err)
+end)
+
+test("Content-Type is only sent with a body", function()
+	local sb, log = H.fake({ ["GET /rest/v1/t"] = { 200, {} }, ["POST /rest/v1/rpc/f"] = { 200, 1 } })
+	sb:from("t"):select():execute()
+	sb.rpc:call("f", { a = 1 }, function() end)
+	assert(log[1].headers["Content-Type"] == nil and log[2].headers["Content-Type"] == "application/json")
 end)

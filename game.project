@@ -1,9 +1,13 @@
 [project]
 title = supabase-defold
-version = 0.1.0
+version = 0.2.0
+dependencies#0 = https://github.com/defold/extension-websocket/archive/refs/tags/4.2.4.zip
 
 [bootstrap]
 main_collection = /example/example.collectionc
+
+[input]
+game_binding = /builtins/input/all.input_bindingc
 
 [library]
 include_dirs = supabase
@@ -11,8 +15,3 @@ include_dirs = supabase
 [display]
 width = 960
 height = 640
-
-[supabase]
-url = 
-anon_key = 
-schema = 
