@@ -35,6 +35,17 @@ else
 	fi
 fi
 
+# --- 2. Version numbers --------------------------------------------------------
+# game.project [project] version and supabase/client.lua M.VERSION must match (tag releases as v<version>)
+project_version="$(sed -n 's/^version *= *//p' game.project | head -n 1)"
+lib_version="$(sed -n 's/^M.VERSION = "\(.*\)"/\1/p' supabase/client.lua)"
+if [ "$project_version" = "$lib_version" ]; then
+	echo "[version] $lib_version"
+else
+	echo "[version] FAIL game.project version ($project_version) != supabase/client.lua M.VERSION ($lib_version)"
+	fail=1
+fi
+
 # --- 3. Defold editor compile -------------------------------------------------
 if [ "${1:-}" != "--no-compile" ]; then
 	if [ -f .internal/editor.port ] && [ -f .internal/editor.token ]; then

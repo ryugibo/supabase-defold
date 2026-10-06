@@ -18,3 +18,4 @@ Defold 용 순수 Lua Supabase 클라이언트 라이브러리. 사용자 문서
 - 빌드 검증: 에디터 없이 `java -cp <Defold jar> com.dynamo.bob.Bob --platform arm64-macos --build-server https://build.defold.com resolve build`
 - 기능 추가 시 해당 모듈의 `tests/test_*.lua` 에 테스트를 추가하고, `README.md` 의 API 표와 Feature coverage 표를 갱신한다.
 - 검증: `tools/verify.sh` (에디터 미실행 시 `--no-compile`).
+- 버전: `game.project` `[project] version` 과 `supabase/client.lua` `M.VERSION` 을 함께 올린다 (verify.sh 가 일치 검사). 릴리스는 `v<버전>` 태그.

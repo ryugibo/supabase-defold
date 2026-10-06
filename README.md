@@ -29,7 +29,8 @@ To use **Realtime**, also add extension-websocket. Defold does not fetch depende
 https://github.com/defold/extension-websocket/archive/refs/tags/4.2.4.zip
 ```
 
-Pin a tag or commit in production. Then run **Project → Fetch Libraries**. Only the `supabase/` folder is shared (`[library] include_dirs = supabase`).
+Pin a version tag in production (`.../archive/refs/tags/v0.2.0.zip`): the branch URL always fetches the latest
+`main`. Then run **Project → Fetch Libraries**. At runtime the library version is `require("supabase.client").VERSION`. Only the `supabase/` folder is shared (`[library] include_dirs = supabase`).
 
 ## Supabase project setup
 
@@ -534,4 +535,4 @@ tools/setup_supabase.sh  link / push / start the smoke test's Supabase project
 
 ## License
 
-Add a license before publishing (MIT is common for Defold libraries).
+[MIT](LICENSE)
